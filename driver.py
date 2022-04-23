@@ -21,10 +21,16 @@ from joblib import parallel_backend
 @jit(nopython=True)
 def Hypervector(D=5000, kind='binary'):
     if kind == 'binary':
-        # specify type to avoid type casting to int
-        return np.float64(2) * np.random.binomial(1.0, 0.5, D).astype(np.float32) - np.float32(1)
+        # specify type to avoid type casting to int.
+        # Numba methods do not work when called with named arguments. 
+        # They do work if passed positional arguments.
+        return np.float64(2) * np.random.binomial(1.0, 0.5, D).astype(np.float64) - np.float64(1)
     elif kind == 'gaussian':
         return np.random.randn(D).astype(np.float64)
+    elif kind == 'uniform':
+        # Numba methods do not work when called with named arguments. 
+        # They do work if passed positional arguments.
+        return np.random.uniform(0.0, 2*np.pi, D).astype(np.float64)
 
 # https://stackoverflow.com/questions/67289738/is-it-possible-to-create-a-
 # numba-dict-whose-key-type-is-unituple-inside-of-a-fun
@@ -38,6 +44,7 @@ spec = [
     ('level_encoding', types.DictType(key_type,value_type)),
     ('position_encoding', types.DictType(key_type,value_type)),
     ('kernel_encoding', types.DictType(key_type,value_type)),
+    ('kernel_base', types.float64[:]),
     ('kind', types.unicode_type)
 ]
 
@@ -66,6 +73,7 @@ class Encoder():
             for f in range(d):
                 self.position_encoding[f] = Hypervector(D=self.D)
         elif self.kind == 'kernel':
+            self.kernel_base = Hypervector(D=self.D, kind='uniform')
             self.kernel_encoding = Dict.empty(key_type=key_type, value_type=value_type)
             for j in range(D):
                 self.kernel_encoding[j] = Hypervector(D=self.d, kind='gaussian')
@@ -114,7 +122,10 @@ class Encoder():
         if self.kind == 'kernel':
             for j in range(self.D):
                 kernel = self.kernel_encoding[j]
-                hypervector[j] += np.cos(kernel @ x)
+                activation = kernel @ x
+                cos_value = np.cos(activation + self.kernel_base[j])
+                sin_value = np.sin(activation)
+                hypervector[j] += (cos_value * sin_value)
         else:
             for f in range(len(x)):
                 level = self.binary_search(x[f])
@@ -154,22 +165,38 @@ def predict(hypervector, class_hypervectors):
             guess, maximum = c, similarities[c]
     return guess
 
-def train(train_hyperX, train_labels, class_hypervectors):
+def train(
+    train_hyperX, 
+    train_labels, 
+    class_hypervectors, 
+    lr=None, 
+    polarize=False, 
+    delay=1
+):
     updated_class_hypervectors = copy.deepcopy(class_hypervectors)
+    if delay > 1:
+        delayed_class_hypervectors = copy.deepcopy(updated_class_hypervectors)
     misclassifications = 0
     n = train_hyperX.shape[0]
     for i in range(n):
-        guess = predict(train_hyperX[i,:], updated_class_hypervectors)
+        guess = predict(train_hyperX[i,:], delayed_class_hypervectors)
         if train_labels[i] != guess:
             misclassifications += 1
-            updated_class_hypervectors[guess] -= train_hyperX[i,:]
-            #updated_class_hypervectors[guess] = polarize(updated_class_hypervectors[guess])
-            updated_class_hypervectors[train_labels[i]] += train_hyperX[i,:]
-            #updated_class_hypervectors[train_labels[i]] = polarize(updated_class_hypervectors[train_labels[i]])
+            if lr is None:
+                updated_class_hypervectors[guess] = updated_class_hypervectors[guess] - train_hyperX[i,:]
+                updated_class_hypervectors[train_labels[i]] = updated_class_hypervectors[train_labels[i]] + train_hyperX[i,:]
+            else:
+                simneg = similarity(updated_class_hypervectors[guess],train_hyperX[i,:])
+                simpos =similarity(updated_class_hypervectors[train_labels[i]],train_hyperX[i,:])
+                updated_class_hypervectors[guess] = updated_class_hypervectors[guess] - lr*simneg*train_hyperX[i,:]
+                updated_class_hypervectors[train_labels[i]] = updated_class_hypervectors[train_labels[i]] + lr*simpos*train_hyperX[i,:]
+        if i % delay == 0:
+            delayed_class_hypervectors = updated_class_hypervectors
     error = misclassifications / n
     print(f'Error: {error} -- Misclassifications: {misclassifications}')
-    for c in updated_class_hypervectors.keys():
-        updated_class_hypervectors[c] = np.where(updated_class_hypervectors[c] >= 0, 1, -1)
+    if polarize:
+        for c in updated_class_hypervectors.keys():
+            updated_class_hypervectors[c] = np.where(updated_class_hypervectors[c] >= 0, 1, -1)
     return error, updated_class_hypervectors
 
 def test(test_hyperX, test_labels, class_hypervectors):
@@ -219,6 +246,17 @@ if __name__ == '__main__':
         X_test = X.iloc[int(tr_prop * n):,:]
         Y_test = Y[int(tr_prop * n):]
 
+        # Convert labels to int:
+        Y_train = np.asarray(Y_train.map(lambda x: int(x[1:-1])))
+        Y_test = np.asarray(Y_test.map(lambda x: int(x[1:-1])))
+
+        # Pickle shuffled labels for later usage.
+        with open('isolet_tr_y.pkl', 'wb') as f:
+            pickle.dump(Y_train, f, pickle.HIGHEST_PROTOCOL)
+
+        with open('isolet_ts_y.pkl', 'wb') as f:
+            pickle.dump(Y_test, f, pickle.HIGHEST_PROTOCOL)
+
         print(f'TRAIN: {X_train.shape} -- {Y_train.shape}')
         print(f'TEST: {X_test.shape} -- {Y_test.shape}')
 
@@ -233,8 +271,6 @@ if __name__ == '__main__':
         # Encode with permutation encoder:
         enc = Encoder(d=617, D=10000, levels=100, fliprate=2000, kind='permutation')
         ini = time.time()
-        # Numba methods do not work when called with named arguments. 
-        # They do work if passed positional arguments.
         hyperX_train = transform(X=np.asarray(X_train)[:,:], encoder=enc, parallel=True, n_jobs=4)
         print(f'Encoded in {time.time()-ini}s')
         # Encoded in 554.1027100086212s
@@ -263,6 +299,39 @@ if __name__ == '__main__':
             ax[1].set_xlabel('Sample')
             ax[1].set_xlabel('Dimension')
             plt.show()
-            
+        
+        # Association encoder:
+        enc = Encoder(d=617, D=10000, levels=100, fliprate=2000, kind='association')
+        ini = time.time()
+        hyperX_train_a = transform(X=np.asarray(X_train)[:,:], encoder=enc, parallel=True, n_jobs=4)
+        print(f'Encoded in {time.time()-ini}s')
+        # Association: Encoded in 100.22649216651917s
+        with open('isolet_tr_association_encoding.pkl', 'wb') as f:
+            pickle.dump(hyperX_train_a, f, pickle.HIGHEST_PROTOCOL)
+
+        ini = time.time()
+        hyperX_test_a = transform(X=np.asarray(X_test)[:,:], encoder=enc, parallel=True, n_jobs=4)
+        print(f'Encoded in {time.time()-ini}s')
+        # Encoded in 25.302175760269165s
+        with open('isolet_ts_association_encoding.pkl', 'wb') as f:
+            pickle.dump(hyperX_test_a, f, pickle.HIGHEST_PROTOCOL)
+
+        # Kernel encoder:
+        enc = Encoder(d=617, D=10000, levels=0, fliprate=0, kind='kernel')
+        ini = time.time()
+        hyperX_train_k = transform(X=np.asarray(X_train)[:,:], encoder=enc, parallel=True, n_jobs=4)
+        print(f'Encoded in {time.time()-ini}s')
+        # Encoded in 221.7497627735138s
+        with open('isolet_tr_kernel_good_encoding.pkl', 'wb') as f:
+            pickle.dump(hyperX_train_k, f, pickle.HIGHEST_PROTOCOL)
+        ini = time.time()
+        hyperX_test_k = transform(X=np.asarray(X_test)[:,:], encoder=enc, parallel=True, n_jobs=4)
+        print(f'Encoded in {time.time()-ini}s')
+        # Encoded in 56.467737913131714s
+        with open('isolet_ts_kernel_good_encoding.pkl', 'wb') as f:
+            pickle.dump(hyperX_test_k, f, pickle.HIGHEST_PROTOCOL)
+
+
+
 
 
