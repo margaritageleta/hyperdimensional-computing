@@ -21,15 +21,11 @@ from joblib import parallel_backend
 @jit(nopython=True)
 def Hypervector(D=5000, kind='binary'):
     if kind == 'binary':
-        # specify type to avoid type casting to int.
-        # Numba methods do not work when called with named arguments. 
-        # They do work if passed positional arguments.
+        # specify type to avoid type casting to int
         return np.float64(2) * np.random.binomial(1.0, 0.5, D).astype(np.float64) - np.float64(1)
     elif kind == 'gaussian':
         return np.random.randn(D).astype(np.float64)
     elif kind == 'uniform':
-        # Numba methods do not work when called with named arguments. 
-        # They do work if passed positional arguments.
         return np.random.uniform(0.0, 2*np.pi, D).astype(np.float64)
 
 # https://stackoverflow.com/questions/67289738/is-it-possible-to-create-a-
@@ -45,7 +41,9 @@ spec = [
     ('position_encoding', types.DictType(key_type,value_type)),
     ('kernel_encoding', types.DictType(key_type,value_type)),
     ('kernel_base', types.float64[:]),
-    ('kind', types.unicode_type)
+    ('kind', types.unicode_type),
+    ('kernel_kind', types.unicode_type),
+    ('polarize', types.boolean)
 ]
 
 @jitclass(spec)
@@ -58,11 +56,15 @@ class Encoder():
         kind='permutation',
         minval=-1,
         maxval=1,
+        kernel_kind='rbf',
+        polarize=True
     ):
         self.d = d
         self.D = D
         self.fliprate = int(D/2/levels) if fliprate is None else fliprate
         self.kind = kind
+        self.kernel_kind = 'none' if kind != 'kernel' else kernel_kind
+        self.polarize = polarize
     
         if self.kind != 'kernel':  
             self.levels = self._get_levels(minval=minval, maxval=maxval, levels=levels)
@@ -73,7 +75,8 @@ class Encoder():
             for f in range(d):
                 self.position_encoding[f] = Hypervector(D=self.D)
         elif self.kind == 'kernel':
-            self.kernel_base = Hypervector(D=self.D, kind='uniform')
+            if self.kernel_kind == 'rbf':
+                self.kernel_base = Hypervector(D=self.D, kind='uniform')
             self.kernel_encoding = Dict.empty(key_type=key_type, value_type=value_type)
             for j in range(D):
                 self.kernel_encoding[j] = Hypervector(D=self.d, kind='gaussian')
@@ -100,6 +103,7 @@ class Encoder():
                 for i in flip_idx:
                     base[i] = -1 * base[i]
             level_encoding[level] = base.copy()
+        # print(level_encoding)
         print('Level hypervectors generated.')
         return level_encoding
     
@@ -123,9 +127,13 @@ class Encoder():
             for j in range(self.D):
                 kernel = self.kernel_encoding[j]
                 activation = kernel @ x
-                cos_value = np.cos(activation + self.kernel_base[j])
-                sin_value = np.sin(activation)
-                hypervector[j] += (cos_value * sin_value)
+                if self.kernel_kind == 'rbf':
+                    cos_value = np.cos(activation + self.kernel_base[j])
+                    sin_value = np.sin(activation)
+                    hypervector[j] += (cos_value * sin_value)
+                elif self.kernel_kind == 'tanh':
+                    hypervector[j] += np.tanh(activation)
+                else: raise Exception('Unknown kernel.')
         else:
             for f in range(len(x)):
                 level = self.binary_search(x[f])
@@ -138,7 +146,23 @@ class Encoder():
                     hypervector += np.roll(level_hypervector, f)
 
                 else: raise Exception('Unknown kind.')
-        return np.where(hypervector >= 0, 1, -1)
+        if self.polarize:
+            return np.where(hypervector >= 0, 1, -1).astype(np.float64) 
+        else: 
+            return hypervector 
+    
+def transform(X, encoder, parallel=True, n_jobs=2):
+    n = X.shape[0]
+    print('Starting transformation...')
+    if parallel:
+        with parallel_backend('threading', n_jobs=n_jobs):
+            hyperX = Parallel()(delayed(encoder._transform_x)(X[i]) for i in range(n))
+    else:
+        hyperX = []
+        #hyperX.append(List.empty_list(numba.float64[:]))
+        for i in range(n):
+            hyperX.append(encoder._transform_x(X[i]))
+    return np.asarray(hyperX)
     
 def transform(X, encoder, parallel=True, n_jobs=2):
     n = X.shape[0]
@@ -154,6 +178,18 @@ def transform(X, encoder, parallel=True, n_jobs=2):
 
 def similarity(v1, v2):
     return (v1 @ v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+
+def get_class_hypervectors(hyperX_train, Y_train, polarize=True):
+    class_hypervectors = dict()
+    for i, c in enumerate(Y_train[:]):
+        if c not in class_hypervectors.keys():
+            class_hypervectors[c] = np.zeros(hyperX_train.shape[1])
+        else:
+            class_hypervectors[c] += hyperX_train[i, :]
+    if polarize:
+        for c in class_hypervectors.keys():
+            class_hypervectors[c] = np.where(class_hypervectors[c] >= 0, 1, -1)
+    return class_hypervectors
 
 def predict(hypervector, class_hypervectors):
     guess = list(class_hypervectors.keys())[0]
@@ -269,7 +305,14 @@ if __name__ == '__main__':
             plt.show()
 
         # Encode with permutation encoder:
-        enc = Encoder(d=617, D=10000, levels=100, fliprate=2000, kind='permutation')
+        enc = Encoder(
+            d=617, 
+            D=10000, 
+            levels=100, 
+            fliprate=2000, 
+            kind='permutation', 
+            polarize=True
+        )
         ini = time.time()
         hyperX_train = transform(X=np.asarray(X_train)[:,:], encoder=enc, parallel=True, n_jobs=4)
         print(f'Encoded in {time.time()-ini}s')
@@ -301,7 +344,14 @@ if __name__ == '__main__':
             plt.show()
         
         # Association encoder:
-        enc = Encoder(d=617, D=10000, levels=100, fliprate=2000, kind='association')
+        enc = Encoder(
+            d=617, 
+            D=10000, 
+            levels=100, 
+            fliprate=2000, 
+            kind='association', 
+            polarize=True
+        )
         ini = time.time()
         hyperX_train_a = transform(X=np.asarray(X_train)[:,:], encoder=enc, parallel=True, n_jobs=4)
         print(f'Encoded in {time.time()-ini}s')
@@ -317,7 +367,15 @@ if __name__ == '__main__':
             pickle.dump(hyperX_test_a, f, pickle.HIGHEST_PROTOCOL)
 
         # Kernel encoder:
-        enc = Encoder(d=617, D=10000, levels=0, fliprate=0, kind='kernel')
+        enc = Encoder(
+            d=617, 
+            D=10000, 
+            levels=0, 
+            fliprate=0, 
+            kind='kernel',
+            kernel_kind='tanh',
+            polarize=False
+        )
         ini = time.time()
         hyperX_train_k = transform(X=np.asarray(X_train)[:,:], encoder=enc, parallel=True, n_jobs=4)
         print(f'Encoded in {time.time()-ini}s')
@@ -330,6 +388,152 @@ if __name__ == '__main__':
         # Encoded in 56.467737913131714s
         with open('isolet_ts_kernel_good_encoding.pkl', 'wb') as f:
             pickle.dump(hyperX_test_k, f, pickle.HIGHEST_PROTOCOL)
+
+        # Get class hypervectors:
+        class_hypervectors_p = get_class_hypervectors(hyperX_train, Y_train, polarize=False)
+        class_hypervectors_a = get_class_hypervectors(hyperX_train_a, Y_train, polarize=False)
+        class_hypervectors_k = get_class_hypervectors(hyperX_train_k, Y_train, polarize=False)
+
+        # Hamming distance between hypervectors:
+        if plot_data:
+            df = pd.DataFrame(class_hypervectors_k).T
+            fig, ax = plt.subplots(1,1,figsize=(18,8))
+            img = ax.imshow(squareform(pdist(df.loc[[i for i in range(1,27)]],metric='cityblock')), cmap='brg')
+            ax.set_xticks(range(26))
+            ax.set_yticks(range(26))
+            ax.set_yticklabels([chr(65+i) for i in range(26)],ha='center')
+            ax.set_xticklabels([chr(65+i) for i in range(26)],ha='center')
+            plt.colorbar(img)
+            plt.show()
+        
+        # One-pass train:
+        error, class_hypervectors_k_trained = train(
+            train_hyperX=hyperX_train_k, 
+            train_labels=Y_train, 
+            class_hypervectors=class_hypervectors_k,
+            lr=None,
+            polarize=False,
+            delay=1
+        )
+        # Inference:
+        test(
+            test_hyperX=hyperX_test_k, 
+            test_labels=Y_test, 
+            class_hypervectors=class_hypervectors_k_trained
+        )
+
+        ## Batch size test:
+        for bz in [1,5,10,15,25,50,100,500]:    
+            acc, _ = retrain_k_times(
+                k=20, 
+                class_hypervectors=class_hypervectors_k, 
+                train_hyperX=hyperX_train_k, 
+                train_labels=Y_train, 
+                test_hyperX=hyperX_test_k, 
+                test_labels=Y_test,
+                polarize=False,
+                delay=bz
+            )
+            with open(f'isolet_acc_retrain_kernel_bz_{bz}_encoding.pkl', 'wb') as f:
+                pickle.dump(acc, f, pickle.HIGHEST_PROTOCOL)
+        for bz in [1,5,10,15,25,50,100,500]:    
+            acc, _ = retrain_k_times(
+                k=20, 
+                class_hypervectors=class_hypervectors_p, 
+                train_hyperX=hyperX_train, 
+                train_labels=Y_train, 
+                test_hyperX=hyperX_test, 
+                test_labels=Y_test,
+                polarize=False,
+                delay=bz
+            )
+            with open(f'isolet_acc_retrain_permutation_bz_{bz}_encoding.pkl', 'wb') as f:
+                pickle.dump(acc, f, pickle.HIGHEST_PROTOCOL)
+        for bz in [1,5,10,15,25,50,100,500]:    
+            acc, _ = retrain_k_times(
+                k=20, 
+                class_hypervectors=class_hypervectors_a, 
+                train_hyperX=hyperX_train_a, 
+                train_labels=Y_train, 
+                test_hyperX=hyperX_test_a, 
+                test_labels=Y_test,
+                polarize=False,
+                delay=bz
+            )
+            with open(f'isolet_acc_retrain_association_bz_{bz}_encoding.pkl', 'wb') as f:
+                pickle.dump(acc, f, pickle.HIGHEST_PROTOCOL)
+
+        ## Dimensionality test:
+        dimensionality = [1000, 2500, 5000, 7500, 10000]
+        for D in dimensionality:
+            enc = Encoder(
+                d=617, 
+                D=10000, 
+                levels=100, 
+                fliprate=2000, 
+                kind='association',
+                kernel_kind='none'
+            )
+            ini = time.time()
+            hyperX_train = transform(X=np.asarray(X_train)[:,:], encoder=enc, parallel=True, n_jobs=4)
+            print(f'Encoded in {time.time()-ini}s')
+            with open(f'isolet_tr_association_{D}_encoding.pkl', 'wb') as f:
+                pickle.dump(hyperX_train, f, pickle.HIGHEST_PROTOCOL)
+            ini = time.time()
+            hyperX_test = transform(X=np.asarray(X_test)[:,:], encoder=enc, parallel=True, n_jobs=4)
+            print(f'Encoded in {time.time()-ini}s')
+            with open(f'isolet_ts_association_{D}_encoding.pkl', 'wb') as f:
+                pickle.dump(hyperX_test, f, pickle.HIGHEST_PROTOCOL)
+            
+            class_hypervectors = get_class_hypervectors(hyperX_train_k, Y_train, polarize=False)
+            acc, _ = retrain_k_times(
+                k=20, 
+                class_hypervectors=class_hypervectors, 
+                train_hyperX=hyperX_train, 
+                train_labels=Y_train, 
+                test_hyperX=hyperX_test, 
+                test_labels=Y_test,
+                polarize=True
+            )
+            with open(f'isolet_acc_retrain_association_{D}_encoding.pkl', 'wb') as f:
+                pickle.dump(acc, f, pickle.HIGHEST_PROTOCOL)
+
+        if plot_data:
+            with open('isolet_acc_retrain_permutation_encoding.pkl', "rb") as f:
+                perm_acc = pickle.load(f)
+            with open('isolet_acc_retrain_association_encoding.pkl', "rb") as f:
+                assc_acc = pickle.load(f)   
+            with open('isolet_acc_retrain_kernel_tanh_encoding.pkl', "rb") as f:
+                kern_acc = pickle.load(f) 
+
+            fig, ax = plt.subplots(1,1,figsize=(12,5))
+            ax.plot(perm_acc)
+            ax.scatter(range(len(perm_acc)),perm_acc, label='Permutation encoding')
+            ax.plot(assc_acc)
+            ax.scatter(range(len(assc_acc)),assc_acc, label='Association encoding')
+            ax.plot(kern_acc)
+            ax.scatter(range(len(kern_acc)),kern_acc, label='Tanh kernel encoding')
+            ax.set_xlabel('Iteration')
+            ax.set_ylabel('Accuracy % on test data')
+            ax.set_xticks(range(21))
+            ax.spines['right'].set_visible(False)
+            ax.spines['top'].set_visible(False)
+            plt.legend()
+            plt.grid(color='gainsboro', zorder=-10)
+            plt.show()
+
+        ## Print results for batch size:
+        for bz in [1,5,10,15,25,50,100,500]:
+            for model in ['kernel','permutation','association']:
+                with open(f'isolet_acc_retrain_{model}_bz_{bz}_encoding.pkl', "rb") as f:
+                    acc = pickle.load(f) 
+                print(f'{bz}--{model}: {np.median(acc[-1:])}')
+
+    elif dataset == 'EEG':
+        pass
+
+    else: raise Exception('Unknown dataset.')
+
 
 
 
