@@ -4,6 +4,7 @@ import pickle
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 from scipy.spatial.distance import squareform, pdist
 
 ## PARALLEL dependencies
@@ -26,6 +27,9 @@ def Hypervector(D=5000, kind='binary'):
     elif kind == 'gaussian':
         return np.random.randn(D).astype(np.float64)
     elif kind == 'uniform':
+        # specify type to avoid type casting to int.
+        # Numba methods do not work when called with named arguments. 
+        # They do work if passed positional arguments.
         return np.random.uniform(0.0, 2*np.pi, D).astype(np.float64)
 
 # https://stackoverflow.com/questions/67289738/is-it-possible-to-create-a-
@@ -260,6 +264,26 @@ def retrain_k_times(k, class_hypervectors, train_hyperX, train_labels, test_hype
         accuracy.append(test(test_hyperX, test_labels, updated_class_hypervectors))
     print(f'Iteration {j+1} -- Accuracy: {accuracy[-1]}')
     return accuracy, updated_class_hypervectors
+
+def transform_time_series(X, encoder, wsize=4, parallel=True, n_jobs=4):
+    n, m = X.shape
+    hyperX = []
+    assert m % wsize == 0, 'Error!'
+    for ni in tqdm.tqdm(range(n)):
+        temporal_patterns = []
+        print(f'Sample #{ni}...')
+        for j in tqdm.tqdm(range(0,m-wsize)):
+            Xin = X[ni,j:j+wsize]
+            #H = transform(Xin, encoder, parallel=parallel, n_jobs=n_jobs)
+            # del Xin
+            # print(j, Xin.shape)
+            H = encoder._transform_x(Xin)
+            temporal_patterns.append(H)
+        print('Adding H...')
+        M = np.sum(temporal_patterns, axis=0)
+        hyperX.append(M)
+        print(M.shape)
+    return np.asarray(hyperX)
 
 if __name__ == '__main__':
 
@@ -530,7 +554,117 @@ if __name__ == '__main__':
                 print(f'{bz}--{model}: {np.median(acc[-1:])}')
 
     elif dataset == 'EEG':
-        pass
+        # Join CSVs:
+        dfs_list = []
+        for csv_filename in tqdm.tqdm(glob.glob('./data/SMNI_CMI_TRAIN/*.csv')):
+            dfs_list.append(pd.read_csv(csv_filename))
+        eeg = pd.concat(dfs_list)
+        del(dfs_list)
+        eeg = eeg.drop(['Unnamed: 0'], axis=1)
+
+        # Transpose the table to make the data extraction easier:
+        transposed_df_list = []
+        for group_df in tqdm.tqdm(eeg.groupby(['name', 'trial number', 'matching condition', 'sensor position', 'subject identifier'])):
+            _df = pd.DataFrame(group_df[1]['sensor value']).T
+            _df.columns = [f'sample_{idx}' for idx in range(256)]
+            _df['name'] = group_df[0][0]
+            _df['trial number'] = group_df[0][1]
+            _df['matching condition'] = group_df[0][2]
+            _df['sensor position'] = group_df[0][3]
+            _df['subject identifier'] = group_df[0][4]
+            
+            transposed_df_list.append(_df)
+            
+        eeg = pd.concat(transposed_df_list)
+        eeg = eeg[[*eeg.columns[-5:],*eeg.columns[0:-5]]]
+        eeg = eeg.reset_index(drop=True)
+
+        # Save dataset for later use:
+        eeg = eeg.sample(frac=1)
+        eeg.iloc[:600,:].to_csv('./eeg_dataset.csv')  
+        # eeg = pd.read_csv('./eeg_dataset.csv')
+
+        X = np.asarray(eeg[[f'sample_{i}' for i in range(0,256)]])
+        Y = np.asarray(eeg['subject identifier'].map(lambda x: 1 if x == 'a' else 0))
+        print(X.shape, Y.shape)
+
+        if plot_data:
+            fig, ax = plt.subplots(1,1,figsize=(20,5))
+            for i in range(X.shape[0]):
+                ax.plot(X[i,:], color='green' if Y[i] == 0 else 'red')
+                if i == 10: break
+            ax.spines['right'].set_visible(False)
+            ax.spines['top'].set_visible(False)
+            ax.set_xlabel('EEG sample')
+            ax.set_ylabel('Value')
+            plt.grid()
+            patches = []
+            patches.append(mpatches.Patch(color='green', label='Control'))
+            patches.append(mpatches.Patch(color='red', label='Alcoholic'))
+            ax.legend(handles=patches, bbox_to_anchor=(0. ,0.80 ,1.9,0.1),loc=10,ncol=1,)
+            plt.show()
+
+            # Histogram of the feature values.
+            plt.hist(np.ravel(X), bins=100)
+            plt.xlim((-50,50))
+            plt.show()
+        
+        # Train/Test split:
+        X_tr = X[:500,:]
+        Y_tr = Y[:500]
+        X_ts = X[500:600,:]
+        Y_ts = Y[500:600]
+        print(X_tr.shape, Y_tr.shape, X_ts.shape, Y_ts.shape)
+
+        dimensionality = [1000, 2500, 5000, 7500, 10000]
+        window_sizes = [2,4,8,16,64]
+
+        for wsize in window_sizes:
+            for D in dimensionality:
+                enc = Encoder(
+                    d=wsize, 
+                    D=D, 
+                    levels=100, 
+                    fliprate=25, 
+                    kind='permutation', 
+                    kernel_kind='none',
+                    polarize=False,
+                    minval=-50,
+                    maxval=50
+                )
+                # Transform data:
+                hyperX_tr = transform_time_series(
+                    X=X_tr, 
+                    encoder=enc, 
+                    wsize=wsize, 
+                    parallel=False, 
+                    n_jobs=8
+                )
+                hyperX_ts = transform_time_series(
+                    X=X_ts, 
+                    encoder=enc, 
+                    wsize=wsize, 
+                    parallel=False, 
+                    n_jobs=8
+                )
+                # Get class hypervectors:
+                class_hypervectors = get_class_hypervectors(hyperX_tr, Y_tr, polarize=False)
+                # Adaptive Train:
+                error, class_hypervectors_trained = train(
+                    train_hyperX=hyperX_tr, 
+                    train_labels=Y_tr, 
+                    class_hypervectors=class_hypervectors,
+                    lr=0.1,
+                    polarize=False,
+                    delay=1
+                )
+                # Test:
+                acc = test(
+                    test_hyperX=hyperX_ts, 
+                    test_labels=Y_ts, 
+                    class_hypervectors=class_hypervectors_trained
+                )
+                print(f'Using D={D}, wsize={wsize}: Acc {acc}')
 
     else: raise Exception('Unknown dataset.')
 
